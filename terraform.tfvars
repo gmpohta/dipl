@@ -1,7 +1,9 @@
+# terraform.tfvars
+
 yc_token       = "y0__wgBEL_MkYEHGMHdEyDk2p7NFzCq_caKCARmQKMUCzu8OAFJ5P8v9Y9E6Sbc"
 yc_cloud_id  = "b1ghaldh06m42l069n7r"
 yc_folder_id = "b1gm4i273dt3chocgk63"
-bucket_name  = "my-iot-data-2024-05-31"
+bucket_name  = "my-iot-data"
 function_name = "data-processor-func"
 database_name = "telemetry_db"
 postgresql_version    = "14"

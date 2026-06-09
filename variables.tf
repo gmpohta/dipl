@@ -1,3 +1,5 @@
+# variables.tf
+
 variable "yc_token" {}
 variable "yc_cloud_id" {}
 variable "yc_folder_id" {}
@@ -90,4 +92,18 @@ variable "db_assign_public_ip" {
   description = "Whether to assign public IP to database host"
   type        = bool
   default     = true
+}
+
+variable "mqtt_username" {
+  description = "MQTT broker username (optional)"
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "mqtt_password" {
+  description = "MQTT broker password (optional)"
+  type        = string
+  default     = ""
+  sensitive   = true
 }
