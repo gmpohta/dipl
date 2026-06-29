@@ -1,3 +1,5 @@
+# resource.tf
+
 # ============================================
 # СЕТЕВЫЕ РЕСУРСЫ
 # ============================================
@@ -41,7 +43,7 @@ resource "yandex_mdb_postgresql_cluster" "db_cluster" {
       database_name = var.database_name
     }
   }
-
+  
   host {
     zone       = var.zone
     subnet_id  = yandex_vpc_subnet.db_subnet_a.id
@@ -296,18 +298,18 @@ resource "yandex_function_trigger" "timer_trigger" {
 
 # Триггер для автоматической эмуляции
 resource "yandex_function_trigger" "mqtt_emulation_trigger" {
-  count = var.enable_auto_emulation ? 1 : 0
+  count = 1
   
   name = "mqtt-emulation-trigger"
 
   timer {
-    cron_expression = "*/2 * * * ? *"  # Каждые 2 минуты
+    cron_expression = "*/1 * * * ? *"  # Каждые 2 минуты
     payload = jsonencode({
-      devices     = var.emulation_devices
+      devices     = ["Device_1", "Device_2","Device_3","Device_4"]
       count       = 5
       interval    = 0.5
       value_range = [0, 100]
-      pattern     = var.emulation_pattern
+      pattern     = "random"
     })
   }
 
@@ -354,10 +356,9 @@ resource "yandex_compute_instance" "mqtt_broker" {
   }
 
   metadata = {
+    ssh-keys = "ubuntu:ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAbrycFWUGU/mp7/DNLHH/EIfhd8g66DZ+i7E0Q5y209 your_email@example.com"
     user-data = <<-EOF
       #cloud-config
-      package_update: true
-      package_upgrade: true
       
       packages:
         - mosquitto
@@ -371,50 +372,65 @@ resource "yandex_compute_instance" "mqtt_broker" {
           content: |
             #!/bin/bash
             
-            TOPIC="$1"
-            PAYLOAD="$2"
+            API_GATEWAY_URL="https://${yandex_api_gateway.api_gw.domain}/data"
+            MQTT_HOST="localhost"
+            MQTT_PORT=1883
+            LOG_FILE="/var/log/mosquitto-forwarder.log"
             
-            # Формируем JSON для отправки в API Gateway
-            # Добавляем топик в качестве device_id если он не указан в payload
-            DATA=$(echo "$PAYLOAD" | jq -c --arg topic "$TOPIC" '{
-                timestamp: (.timestamp // (now | strftime("%Y-%m-%dT%H:%M:%SZ"))),
-                value: (.value // (. | tonumber? // .)),
-                device_id: (.device_id // $topic)
-            }' 2>/dev/null || echo "$PAYLOAD" | jq -c --arg topic "$TOPIC" '{
-                timestamp: (now | strftime("%Y-%m-%dT%H:%M:%SZ")),
-                value: (. | tonumber? // .),
-                device_id: $topic
-            }')
-            
-            # Отправляем в API Gateway
-            RESPONSE=$(curl -s -X POST \
-                -H "Content-Type: application/json" \
-                -d "$DATA" \
-                -w "\n%{http_code}" \
-                "${api_gateway_url}/")
-            
-            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-            BODY=$(echo "$RESPONSE" | head -n-1)
-            
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - Topic: $TOPIC - HTTP $HTTP_CODE - $BODY" >> /var/log/mosquitto-forwarder.log
+            # Подписываемся на все топики и построчно обрабатываем
+            mosquitto_sub -h "$MQTT_HOST" -p "$MQTT_PORT" -t "#" -v | while read -r topic payload; do
+                # Пропускаем системные топики
+                [[ "$topic" == \$SYS/* ]] && continue
+                
+                # Формируем JSON для отправки в API Gateway
+                DATA=$(echo "$payload" | jq -c --arg topic "$topic" '{
+                    timestamp: (.timestamp // (now | strftime("%Y-%m-%dT%H:%M:%SZ"))),
+                    value: (.value // (. | tonumber? // .)),
+                    device_id: (.device_id // $topic)
+                }' 2>/dev/null || echo "$payload" | jq -c --arg topic "$topic" '{
+                    timestamp: (now | strftime("%Y-%m-%dT%H:%M:%SZ")),
+                    value: (. | tonumber? // .),
+                    device_id: $topic
+                }')
+                
+                # Отправляем в API Gateway
+                RESPONSE=$(curl -s -X POST \
+                    -H "Content-Type: application/json" \
+                    -d "$DATA" \
+                    -w "\n%%{http_code}" \
+                    "$API_GATEWAY_URL/")
+                
+                HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+                BODY=$(echo "$RESPONSE" | head -n-1)
+                
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Topic: $topic - HTTP $HTTP_CODE - $BODY" >> "$LOG_FILE"
+            done
 
-        - path: /etc/mosquitto/conf.d/forwarder.conf
-          content: |
-            # Подписываемся на все топики и вызываем скрипт при получении сообщения
-            topic # out /opt/mosquitto-forwarder/forward.sh
+        - path: /etc/systemd/system/mqtt-forwarder.service
           permissions: '0644'
+          content: |
+            [Unit]
+            Description=MQTT to API Gateway Forwarder
+            After=mosquitto.service
+            Requires=mosquitto.service
+            
+            [Service]
+            Type=simple
+            ExecStart=/opt/mosquitto-forwarder/forward.sh
+            Restart=always
+            RestartSec=5
+            
+            [Install]
+            WantedBy=multi-user.target
 
         - path: /etc/mosquitto/conf.d/default.conf
           content: |
             listener 1883 0.0.0.0
             allow_anonymous true
             
-            # WebSocket для веб-клиентов
             listener 9001
             protocol websockets
             
-            # Логирование
-            log_dest file /var/log/mosquitto/mosquitto.log
             log_type all
             log_timestamp true
           permissions: '0644'
@@ -425,14 +441,16 @@ resource "yandex_compute_instance" "mqtt_broker" {
         - touch /var/log/mosquitto-forwarder.log
         - chmod 644 /var/log/mosquitto-forwarder.log
         
-        # Перезапускаем Mosquitto с новой конфигурацией
+        # Перезапускаем Mosquitto
         - systemctl restart mosquitto
+        - sleep 3
         
-        # Проверяем статус
-        - sleep 5
-        - systemctl status mosquitto --no-pager
+        # Включаем и запускаем форвардер
+        - systemctl daemon-reload
+        - systemctl enable mqtt-forwarder
+        - systemctl start mqtt-forwarder
         
-        - echo "Mosquitto MQTT Broker setup complete!"
+        - echo "Mosquitto MQTT Broker + Forwarder setup complete!"
     EOF
   }
 
@@ -469,4 +487,183 @@ output "mqtt_connection_info" {
     port     = 1883
     ws_port  = 9001
   }
+}
+# ============================================
+# GRAFANA НА ВИРТУАЛЬНОЙ МАШИНЕ
+# (Managed Service пока не завезли в провайдер, качаю сам)
+# ============================================
+
+# Группа безопасности для Grafana
+resource "yandex_vpc_security_group" "grafana_sg" {
+  name       = "grafana-security-group"
+  network_id = yandex_vpc_network.iot_network.id
+
+  ingress {
+    description    = "Allow Grafana Web Interface"
+    protocol       = "TCP"
+    port           = 3000
+    v4_cidr_blocks = ["0.0.0.0/0"] # ЗАМЕНИ НА СВОЙ IP потом!
+  }
+
+  # Порт 8080 для плагинов или прокси, если вдруг понадобится
+  ingress {
+    description    = "Grafana alternative port"
+    protocol       = "TCP"
+    port           = 8080
+    v4_cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description    = "SSH"
+    protocol       = "TCP"
+    port           = 22
+    v4_cidr_blocks = ["0.0.0.0/0"] # Тоже лучше ограничить до своего IP
+  }
+
+  egress {
+    description    = "Allow all outbound traffic"
+    protocol       = "ANY"
+    v4_cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# Сама виртуалка с Grafana
+resource "yandex_compute_instance" "grafana_vm" {
+  name        = "grafana-instance"
+  platform_id = "standard-v2"
+  zone        = var.zone
+
+  resources {
+    cores  = 2
+    memory = 2 # 2 ГБ для Grafana — комфортный минимум
+  }
+
+  boot_disk {
+    initialize_params {
+      image_id = data.yandex_compute_image.ubuntu_image.id
+      size     = 20
+      type     = "network-ssd"
+    }
+  }
+
+  network_interface {
+    subnet_id          = yandex_vpc_subnet.vm_subnet_a.id
+    nat                = true
+    security_group_ids = [yandex_vpc_security_group.grafana_sg.id]
+  }
+
+  metadata = {
+    ssh-keys = "ubuntu:ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAbrycFWUGU/mp7/DNLHH/EIfhd8g66DZ+i7E0Q5y209 your_email@example.com"
+    user-data = <<-EOF
+      #cloud-config
+      
+      packages:
+        - wget
+        - curl
+        - jq
+
+      write_files:
+        - path: /opt/grafana-setup.sh
+          permissions: '0755'
+          content: |
+            #!/bin/bash
+            set -e
+            
+            echo "=== Grafana Post-Install Setup ==="
+            
+            # Wait for Grafana to be ready
+            echo "Waiting for Grafana to be ready..."
+            ATTEMPT=0
+            MAX_ATTEMPTS=30
+            while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+              HTTP_STATUS=$(curl -s -o /dev/null -w '%%{http_code}' http://localhost:3000/api/health)
+              if [ "$HTTP_STATUS" = "200" ]; then
+                echo "Grafana is ready!"
+                break
+              fi
+              ATTEMPT=$((ATTEMPT + 1))
+              echo "Attempt $ATTEMPT/$MAX_ATTEMPTS: HTTP $HTTP_STATUS, waiting 10 seconds..."
+              sleep 10
+            done
+            
+            if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+              echo "ERROR: Grafana did not start within timeout"
+              exit 1
+            fi
+            
+            # Change admin password
+            echo "Changing default admin password..."
+            curl -s -X PUT \
+              -H 'Content-Type: application/json' \
+              -d '{"oldPassword":"admin","newPassword":"${var.grafana_admin_password}"}' \
+              http://admin:admin@localhost:3000/api/user/password
+            
+            sleep 3
+            
+            # Add PostgreSQL datasource
+            echo "Adding PostgreSQL datasource..."
+            curl -s -X POST \
+              -H 'Content-Type: application/json' \
+              -d '{"name":"PostgreSQL IoT","type":"postgres","url":"${yandex_mdb_postgresql_cluster.db_cluster.host[0].fqdn}:${var.db_port}","database":"${var.database_name}","user":"${var.db_user_name}","secureJsonData":{"password":"${var.db_user_password}"},"access":"proxy","jsonData":{"sslmode":"require","postgresVersion":1500,"timescaledb":false}}' \
+              http://admin:${var.grafana_admin_password}@localhost:3000/api/datasources
+            
+            # List current datasources
+            echo "Current datasources:"
+            curl -s http://admin:${var.grafana_admin_password}@localhost:3000/api/datasources | jq -r '.[].name' || echo "Could not list datasources"
+            
+            echo "=== Setup completed ==="
+
+      runcmd:
+        # Install Grafana
+        - wget -q https://dl.grafana.com/oss/release/grafana_10.4.2_amd64.deb -O /tmp/grafana.deb
+        - dpkg -i /tmp/grafana.deb
+        - apt-get install -f -y
+        - rm /tmp/grafana.deb
+        - systemctl daemon-reload
+        - systemctl enable grafana-server
+        - systemctl start grafana-server
+        - echo "Grafana installed and running"
+        # Wait for Grafana to fully start
+        - sleep 20
+        # Run setup script
+        - /opt/grafana-setup.sh
+        - echo "Grafana setup script completed"
+    EOF
+  }
+
+  depends_on = [
+    yandex_vpc_subnet.vm_subnet_a,
+    yandex_mdb_postgresql_cluster.db_cluster
+  ]
+}
+
+# ============================================
+# ВЫХОДНЫЕ ДАННЫЕ GRAFANA
+# ============================================
+
+output "grafana_url" {
+  value = "http://${yandex_compute_instance.grafana_vm.network_interface[0].nat_ip_address}:3000"
+}
+
+output "grafana_login" {
+  value = "admin"
+}
+
+output "grafana_password" {
+  value     = var.grafana_admin_password
+  sensitive = true
+}
+
+output "grafana_datasource_info" {
+  value = {
+    url        = "http://${yandex_compute_instance.grafana_vm.network_interface[0].nat_ip_address}:3000"
+    login      = "admin"
+    datasource = "PostgreSQL IoT"
+    database   = var.database_name
+    host       = yandex_mdb_postgresql_cluster.db_cluster.host[0].fqdn
+  }
+}
+
+output "grafana_note" {
+  value = "Источник данных PostgreSQL 'PostgreSQL IoT' настраивается автоматически при создании VM. Можете сразу создавать дашборды!"
 }

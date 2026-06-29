@@ -6,6 +6,7 @@ variable "yc_folder_id" {}
 variable "bucket_name" {}
 variable "function_name" {}
 variable "database_name" {}
+
 variable "storage_endpoint" {
   description = "Endpoint URL for Yandex Object Storage"
   type        = string
@@ -103,6 +104,17 @@ variable "mqtt_username" {
 
 variable "mqtt_password" {
   description = "MQTT broker password (optional)"
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+# ============================================
+# ПЕРЕМЕННЫЕ GRAFANA
+# ============================================
+
+variable "grafana_admin_password" {
+  description = "New admin password for Grafana"
   type        = string
   default     = ""
   sensitive   = true
