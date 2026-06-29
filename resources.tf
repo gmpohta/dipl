@@ -365,7 +365,7 @@ resource "yandex_compute_instance" "mqtt_broker" {
         - mosquitto-clients
         - curl
         - jq
-      
+
       write_files:
         - path: /opt/mosquitto-forwarder/forward.sh
           permissions: '0755'
@@ -382,28 +382,57 @@ resource "yandex_compute_instance" "mqtt_broker" {
                 # Пропускаем системные топики
                 [[ "$topic" == \$SYS/* ]] && continue
                 
-                # Формируем JSON для отправки в API Gateway
-                DATA=$(echo "$payload" | jq -c --arg topic "$topic" '{
-                    timestamp: (.timestamp // (now | strftime("%Y-%m-%dT%H:%M:%SZ"))),
-                    value: (.value // (. | tonumber? // .)),
-                    device_id: (.device_id // $topic)
-                }' 2>/dev/null || echo "$payload" | jq -c --arg topic "$topic" '{
-                    timestamp: (now | strftime("%Y-%m-%dT%H:%M:%SZ")),
-                    value: (. | tonumber? // .),
-                    device_id: $topic
-                }')
+                # Проверяем, является ли payload валидным JSON
+                if ! echo "$payload" | jq empty 2>/dev/null; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR: Invalid JSON from topic $topic" >> "$LOG_FILE"
+                    continue
+                fi
+                
+                # Извлекаем данные из нового формата
+                DEVICE_ID=$(echo "$payload" | jq -r '.device_id')
+                FIRMWARE_VERSION=$(echo "$payload" | jq -r '.firmware_version')
+                STATUS=$(echo "$payload" | jq -r '.status')
+                TIMESTAMP=$(echo "$payload" | jq -r '.timestamp')
+                
+                # Извлекаем метрики
+                TEMPERATURE=$(echo "$payload" | jq -r '.metrics.temperature_c')
+                HUMIDITY=$(echo "$payload" | jq -r '.metrics.humidity_percent')
+                BATTERY=$(echo "$payload" | jq -r '.metrics.battery_level_percent')
+                
+                # Формируем данные для отправки в API Gateway
+                DATA=$(jq -n \
+                    --arg device_id "$DEVICE_ID" \
+                    --arg firmware_version "$FIRMWARE_VERSION" \
+                    --arg status "$STATUS" \
+                    --arg timestamp "$TIMESTAMP" \
+                    --arg topic "$topic" \
+                    --argjson temperature "$TEMPERATURE" \
+                    --argjson humidity "$HUMIDITY" \
+                    --argjson battery "$BATTERY" \
+                    '{
+                        device_id: $device_id,
+                        firmware_version: $firmware_version,
+                        status: $status,
+                        timestamp: $timestamp,
+                        topic: $topic,
+                        metrics: {
+                            temperature_c: $temperature,
+                            humidity_percent: $humidity,
+                            battery_level_percent: $battery
+                        }
+                    }')
                 
                 # Отправляем в API Gateway
                 RESPONSE=$(curl -s -X POST \
                     -H "Content-Type: application/json" \
                     -d "$DATA" \
-                    -w "\n%%{http_code}" \
+                    -w "\n%{http_code}" \
                     "$API_GATEWAY_URL/")
                 
                 HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
                 BODY=$(echo "$RESPONSE" | head -n-1)
                 
-                echo "$(date '+%Y-%m-%d %H:%M:%S') - Topic: $topic - HTTP $HTTP_CODE - $BODY" >> "$LOG_FILE"
+                echo "$(date '+%Y-%m-%d %H:%M:%S') - Topic: $topic - Device: $DEVICE_ID - Status: $STATUS - Temp: ${TEMPERATURE}°C - Hum: ${HUMIDITY}% - Bat: ${BATTERY}% - HTTP $HTTP_CODE" >> "$LOG_FILE"
             done
 
         - path: /etc/systemd/system/mqtt-forwarder.service
